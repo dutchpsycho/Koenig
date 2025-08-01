@@ -1,0 +1,11 @@
+[package]
+name = "koenig_spec"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "koenig"
+path = "integration/spec.rs"
+
+[dependencies]
+koenig = { path = "../../Koenig" }

@@ -1,0 +1,20 @@
+[package]
+name = "koenig"
+version = "0.1.0"
+edition = "2021"
+authors = ["Damon", "TITAN Softwork Solutions"]
+description = "KOENIG: Encrypted macro + runtime framework for compile-time string encryption"
+repository = "https://github.com/dutchpsycho/KOENIG"
+readme = "README.md"
+keywords = ["crypto", "encryption", "macros", "framework"]
+categories = ["cryptography", "command-line-utilities"]
+license = "AGPL-3.0"
+license-file = "LICENSE"
+exclude = ["/target", "**/target", ".gitignore", ".vscode", ".github"]
+
+[dependencies]
+koenig_core = { path = "./koenig_core" }
+koenig_macros = { path = "./koenig_macros" }
+
+[lib]
+path = "./lib.rs"
