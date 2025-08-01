@@ -1,0 +1,14 @@
+[package]
+name = "koenig_macros"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+koenig_core = { path = "../koenig_core" }
+proc-macro2 = "1"
+quote = "1"
+rand = "0.8"
+syn = "2.0.104"
