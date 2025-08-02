@@ -12,7 +12,11 @@
  *  KOENIG is a compile-time macro encryption framework for Rust,
  *  designed to protect embedded string literals via high-entropy encryption
  *  engines. Each engine is tailored to an encryption preference,
- *  eg; Absolut is intended for important values while Gamera is much weaker but small & fast.
+ * 
+ *  Absolut: ASCON128 X KMAC256
+ *  Gamera: Complex inline assembly
+ *  Jesko: ChaCha20 X Blake3
+ *  Sadair: AES-GCM-256
  *
  *  License:      GNU Affero General Public License v3.0 (AGPL-3.0)
  *  Copyright:    (C) 2025 TITAN Softwork Solutions. All rights reserved.
