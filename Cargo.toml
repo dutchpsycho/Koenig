@@ -16,5 +16,8 @@ exclude = ["/target", "**/target", ".gitignore", ".vscode", ".github"]
 koenig_core = { path = "./koenig_core" }
 koenig_macros = { path = "./koenig_macros" }
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 path = "./lib.rs"
