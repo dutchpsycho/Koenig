@@ -1,14 +1,12 @@
-# KOENIG
+# Koenig
 
-Koenig is a modular Rust encryption framework that provides compile-time macros and a runtime core library to securely encrypt and decrypt data. It leverages modern cryptography primitives; BLAKE3, ChaCha20-Poly1305, AES-GCM, HMAC—and zeroization for sensitive data.
+Koenig is a Rust compile-time encryption tool that provides compile-time macros and a runtime core library to securely encrypt and decrypt strings. Koenig is extremely easy to embed in already existant codebases and usage requires minimal changes, Koenig's core cryptography engines are also exposed for usage.
 
 ## FEATURES
 
-- **Compile-time encryption macros** that embed encrypted data directly in your binary.  
-- **Decryption macros** to recover data at runtime.  
-- **Multiple algorithm variants**: Jesko, Absolut, Sadair, Gamera.  
-- **Zeroization** of secrets to reduce memory exposure.  
-- **Core API** for manual encryption/decryption and advanced use cases.
+- **Multiple encryption engines**: Jesko, Absolut, Sadair, Gamera.
+- **MAC verifcation** on-execution data tamper protection.
+- **Mutli-string encryption**: To encrypt large amounts of data.
 
 ## CRATE STRUCTURE
 
@@ -58,18 +56,14 @@ fn main() {
 }
 ```
 
-## MACROS
+## ENGINE MACROS
 
 | Macro          | What it does                                               |
 | -------------- | ---------------------------------------------------------- |
-| `jesko!()`     | Encrypt a single string literal.                           |
-| `jeskoex!()`   | Encrypt multiple string literals (returns `String` array). |
-| `absolut!()`   | Encrypt with the "Absolut" engine.                         |
-| `absolutex!()` | Multi-literal variant of `absolut!()`.                     |
-| `sadair!()`    | Encrypt with the "Sadair" engine.                          |
-| `sadairex!()`  | Multi-literal variant of `sadair!()`.                      |
-| `gamera!()`    | Encrypt with the "Gamera" engine.                          |
-| `gameraex!()`  | Multi-literal variant of `gamera!()`.                      |
+| `jesko!()`     | ChaCha20XBlake3 & MAC Authentication.                      |
+| `absolut!()`   | Ascon128 X KMAC256                                         |
+| `sadair!()`    | AES-GCM-256                                                |
+| `gamera!()`    | Complex-inline assembly                                    |
 
 All macros expand to a `String` (or `[String; N]` for the `*ex!` variants), embedding encrypted data in your compiled binary.
 
