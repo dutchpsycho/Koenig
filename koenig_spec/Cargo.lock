@@ -265,6 +265,7 @@ dependencies = [
  "hmac",
  "poly1305",
  "rand",
+ "subtle",
  "tiny-keccak",
  "zeroize",
 ]
@@ -273,6 +274,7 @@ dependencies = [
 name = "koenig_macros"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "koenig_core",
  "proc-macro2",
  "quote",

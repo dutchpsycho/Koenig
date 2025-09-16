@@ -1,38 +1,35 @@
 #![doc = r#"
-# Jesko Engine
+# Jesko Engine (hardened)
 
-**Jesko** is a hybrid symmetric encryption engine tailored **stealth string encryption** scenarios.
-It combines:
+**Jesko** is a hybrid symmetric encryption engine tailored to **stealth string
+encryption** scenarios.
 
-- `BLAKE3`-based stateless key derivation  
-- `ChaCha20` stream encryption  
-- Lightweight XOR-based post-mutation  
-- `BLAKE3` MAC authentication  
-- Key fragmentation and masking for memory obfuscation
-
-It is **fast**, **portable**, and designed to **avoid traditional cryptographic signatures**, while remaining secure enough for sensitive short-lived data like payload strings, C2 tokens, or runtime config blobs.
-
-Implements the [`Encryptor`](crate::Encryptor) trait.
+Hardenings vs. initial design:
+- Key separation (ENC/MAC) via BLAKE3 domain separation
+- Deterministic nonce derived from `enc_key || seed` (u64), not raw key bytes
+- MAC computed over the **raw stream ciphertext** (pre-obfuscation)
+- Obfuscation keyed by `enc_key` as well as seed
+- Constant-time MAC verification
+- Wider `seed: u64`
+- Zeroization completeness and release-abort on auth failure
 "#]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use chacha20::ChaCha20 as StreamX;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use blake3::{Hasher as B3Hasher, hash as bl3_hash};
 
 use rand::{rngs::OsRng, RngCore};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
-use crate::Encryptor;
+use crate::{Encryptor, SecretStr};
 
 /// Jesko provides stealth-grade string encryption for short-lived sensitive data.
-///
-/// Unlike traditional AEADs, Jesko does not store the nonce alongside the ciphertext,
-/// relying on a reproducible (but obfuscated) derivation based on a caller-provided `seed`.
-///
-/// Used primarily for:
-/// - Config strings
-/// - Payload staging
-/// - Runtime string obfuscation in AV/EDR-hostile environments
 pub struct Jesko;
 
 /// Internal masked key container used to store XOR-fragmented key material
@@ -45,50 +42,53 @@ struct MaskedKey {
     mask: [[u8; 8]; 4],
 }
 
+#[inline(always)]
+fn split_keys(master: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    // Domain-separated BLAKE3-derived subkeys
+    let enc = blake3::keyed_hash(master, b"KOENIG/JESKO/ENC");
+    let mac = blake3::keyed_hash(master, b"KOENIG/JESKO/MAC");
+    (*enc.as_bytes(), *mac.as_bytes())
+}
+
 impl Jesko {
     /// Derives a 256-bit key from a 64-byte spell using BLAKE3.
-    ///
-    /// # Arguments
-    /// - `spell`: Randomly generated entropy input
-    ///
-    /// # Returns
-    /// - `[u8; 32]` – the derived symmetric key
     #[inline(always)]
     fn derive_key(spell: &[u8]) -> [u8; 32] {
         *bl3_hash(spell).as_bytes()
     }
 
-    /// Constructs a deterministic, seed-obfuscated nonce from the first 12 bytes of the key.
-    ///
-    /// # Arguments
-    /// - `seed`: Runtime seed value
-    /// - `key`: The full derived 256-bit key
-    ///
-    /// # Returns
-    /// - `[u8; 12]` nonce for ChaCha20
+    /// Deterministic 96-bit nonce from (enc_key || seed)
     #[inline(always)]
-    fn make_nonce(seed: u8, key: &[u8; 32]) -> [u8; 12] {
+    fn make_nonce(seed: u64, enc_key: &[u8; 32]) -> [u8; 12] {
+        let mut inbuf = [0u8; 32 + 8];
+        inbuf[..32].copy_from_slice(enc_key);
+        inbuf[32..].copy_from_slice(&seed.to_le_bytes());
+        let digest = bl3_hash(&inbuf);
         let mut n = [0u8; 12];
-        for (i, &b) in key.iter().take(12).enumerate() {
-            n[i] = b ^ ((i as u8).wrapping_add(seed).rotate_left(1)) ^ 0xA5;
-        }
+        n.copy_from_slice(&digest.as_bytes()[..12]);
         n
     }
 
-    /// Applies post-encryption XOR mutation to ciphertext.
-    ///
-    /// Helps prevent pattern matching on raw ChaCha20 output.
+    /// Keyed post-encryption mutation to disrupt pattern matching on raw stream output.
     #[inline(always)]
-    fn post_mutate(buf: &mut [u8], seed: u8) {
+    fn post_mutate(buf: &mut [u8], seed: u64, enc_key: &[u8; 32]) {
+        let kmix = enc_key[0] ^ enc_key[13] ^ enc_key[31];
+        let seed8 = seed.to_le_bytes();
         for (i, b) in buf.iter_mut().enumerate() {
-            *b ^= seed.rotate_left((i % 5) as u32) ^ 0x9B;
+            let r = seed8[i & 7].rotate_left(((i as u32) % 7) + 1)
+                ^ kmix.rotate_left((i % 5) as u32);
+            *b ^= r ^ 0x9B;
         }
     }
 
+    /// Reverses `post_mutate`.
+    #[inline(always)]
+    fn post_unmutate(buf: &mut [u8], seed: u64, enc_key: &[u8; 32]) {
+        // XOR is involutive; same as mutate.
+        Self::post_mutate(buf, seed, enc_key);
+    }
+
     /// Splits a 256-bit key into four 64-bit fragments, each masked with random 8-byte junk.
-    ///
-    /// # Returns
-    /// - `MaskedKey` – XOR-fragmented structure holding real key material and masks
     #[inline(always)]
     fn mask_key(key: &[u8; 32]) -> MaskedKey {
         let mut frag = [[0u8; 8]; 4];
@@ -102,98 +102,120 @@ impl Jesko {
         MaskedKey { frag, mask }
     }
 
-    /// Computes a keyed BLAKE3 MAC tag over the ciphertext.
-    ///
-    /// # Arguments
-    /// - `ct`: The ciphertext to tag
-    /// - `key`: The full derived key
-    ///
-    /// # Returns
-    /// - `[u8; 32]` – authentication tag
+    /// Computes a keyed BLAKE3 MAC tag over the ciphertext (pre-mutation).
     #[inline(always)]
-    fn compute_mac(ct: &[u8], key: &[u8; 32]) -> [u8; 32] {
-        let mut h = B3Hasher::new_keyed(key);
-        h.update(ct);
+    fn compute_mac(ct_stream: &[u8], mac_key: &[u8; 32]) -> [u8; 32] {
+        let mut h = B3Hasher::new_keyed(mac_key);
+        h.update(ct_stream);
         *h.finalize().as_bytes()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn die() -> ! {
+        #[cfg(debug_assertions)]
+        panic!("KOENIG/JESKO: verification failed");
+        #[cfg(not(debug_assertions))]
+        unsafe { core::intrinsics::abort() }
     }
 }
 
 impl Encryptor for Jesko {
     /// Encrypts plaintext using:
     /// 1. BLAKE3 key derivation from a random `spell`
-    /// 2. Deterministic seed-mixed nonce
-    /// 3. ChaCha20 stream encryption
-    /// 4. XOR mutation of ciphertext
-    /// 5. MAC tagging and key fragmentation
-    ///
-    /// # Returns
-    /// - `(ciphertext, mac_tag, key_fragments, mask)`
+    /// 2. Key splitting (ENC/MAC) with domain separation
+    /// 3. Deterministic nonce from (enc_key || seed)
+    /// 4. ChaCha20 stream encryption
+    /// 5. MAC over raw stream ciphertext
+    /// 6. Keyed XOR mutation of ciphertext
+    /// 7. Key fragmentation + masking
     #[inline(always)]
     fn encrypt(
         plain: &[u8],
-        seed: u8,
+        seed: u64,
     ) -> (Vec<u8>, [u8; 32], [[u8; 8]; 4], [[u8; 8]; 4]) {
         let mut spell = [0u8; 64];
         OsRng.fill_bytes(&mut spell);
 
-        let mut key = Self::derive_key(&spell);
-        let nonce = Self::make_nonce(seed, &key);
-        let mut nonce_copy = nonce;
+        let mut master = Self::derive_key(&spell);
+        let (mut enc_key, mut mac_key) = split_keys(&master);
+
         let mut ct = plain.to_vec();
+        let mut nonce = Self::make_nonce(seed, &enc_key);
+        StreamX::new(&enc_key.into(), &nonce.into()).apply_keystream(&mut ct);
 
-        StreamX::new(&key.into(), &nonce.into()).apply_keystream(&mut ct);
-        Self::post_mutate(&mut ct, seed);
+        let mut tag = Self::compute_mac(&ct, &mac_key);
+        // Obfuscate after MAC:
+        Self::post_mutate(&mut ct, seed, &enc_key);
 
-        let mac = Self::compute_mac(&ct, &key);
-        let MaskedKey { frag, mask } = Self::mask_key(&key);
+        let MaskedKey { frag, mask } = Self::mask_key(&master);
 
-        key.zeroize();
+        // Hygiene
+        enc_key.zeroize();
+        mac_key.zeroize();
+        master.zeroize();
         spell.zeroize();
-        nonce_copy.zeroize();
+        nonce.zeroize();
 
-        (ct, mac, frag, mask)
+        (ct, tag, frag, mask)
     }
 
     /// Decrypts the ciphertext using reconstructed key and nonce.
     ///
-    /// # Panics
-    /// - If MAC verification fails
-    /// - If the tag is invalid or length is incorrect
-    /// - If output is not valid UTF-8
+    /// # Panics/Aborts
+    /// - Aborts in release if MAC verification fails
+    /// - Panics in debug if verification fails or UTF-8 invalid
     #[inline(always)]
     fn decrypt(
         ct: &[u8],
         tag: &[u8],
         frag: [[u8; 8]; 4],
         mask: [[u8; 8]; 4],
-        seed: u8,
-    ) -> String {
-        let mut key = [0u8; 32];
+        seed: u64,
+    ) -> SecretStr {
+        let mut master = [0u8; 32];
         for i in 0..4 {
             for j in 0..8 {
-                key[i * 8 + j] = frag[i][j] ^ mask[i][j];
+                master[i * 8 + j] = frag[i][j] ^ mask[i][j];
             }
         }
 
         if tag.len() != 32 {
-            panic!("Jesko: invalid tag length");
+            Self::die();
         }
 
-        let expected = Self::compute_mac(ct, &key);
-        if expected != tag {
-            panic!("Jesko: MAC verification failed");
-        }
+        let (mut enc_key, mut mac_key) = split_keys(&master);
 
-        let nonce = Self::make_nonce(seed, &key);
-        let mut nonce_copy = nonce;
+        // Undo obfuscation
         let mut data = ct.to_vec();
+        Self::post_unmutate(&mut data, seed, &enc_key);
 
-        Self::post_mutate(&mut data, seed);
-        StreamX::new(&key.into(), &nonce.into()).apply_keystream(&mut data);
+        // Verify MAC (constant-time) over stream ciphertext
+        let expected = Self::compute_mac(&data, &mac_key);
+        let ok = expected.ct_eq(tag.try_into().unwrap()).unwrap_u8() == 1;
+        // zeroize sensitive buffers
+        // (tag is borrowed; we can't zeroize it here)
+        let mut expected_mut = expected;
+        expected_mut.zeroize();
+        if !ok {
+            enc_key.zeroize();
+            mac_key.zeroize();
+            master.zeroize();
+            Self::die();
+        }
 
-        key.zeroize();
-        nonce_copy.zeroize();
+        // Stream decrypt
+        let mut nonce = Self::make_nonce(seed, &enc_key);
+        StreamX::new(&enc_key.into(), &nonce.into()).apply_keystream(&mut data);
 
-        String::from_utf8(data).expect("Jesko: invalid UTF-8")
+        // Hygiene
+        enc_key.zeroize();
+        mac_key.zeroize();
+        master.zeroize();
+        nonce.zeroize();
+
+        // Move `data` into String; wiped on SecretStr::drop
+        let s = String::from_utf8(data).expect("Jesko: invalid UTF-8");
+        SecretStr(s)
     }
 }

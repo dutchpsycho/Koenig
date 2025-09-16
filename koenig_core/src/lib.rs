@@ -1,59 +1,48 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2025 TITAN Softwork Solutions
+// Copyright (C) 2025
+//
+// KOENIG Core Library
+//
+// This crate provides the core traits, types, and engine wiring for KOENIG — a
+// compile-time macro encryption/obfuscation framework for Rust. Engines live
+// under `crate::engines` and implement the `Encryptor` trait.
+//
+// Notes:
+// - `no_std` friendly (uses `alloc`).
+// - Engines should minimize secret lifetimes and zeroize sensitive material.
 
-/*!
- * ==================================================================================
- *  Repository:   KOENIG
- *  Project:      TSS
- *  File:         koenig_core lib
- *  Organization: TITAN Softwork Solutions
- *
- *  Description:
- *  KOENIG is a compile-time macro encryption framework for Rust,
- *  designed to protect embedded string literals via high-entropy encryption
- *  engines. Each engine is tailored to an encryption preference,
- *
- *  Absolut: Ascon128 X KMAC256
- *  Gamera: Complex inline assembly
- *  Jesko: ChaCha20 X Blake3
- *  Sadair: AES-GCM-256
- *
- *  License:      GNU Affero General Public License v3.0 (AGPL-3.0)
- *  Copyright:    (C) 2025 TITAN Softwork Solutions. All rights reserved.
- *
- *  Licensing Terms:
- *  ----------------------------------------------------------------------------------
- *   - You are free to use, modify, and share this software under the terms of AGPL-3.0.
- *   - All derivative works must also be licensed under AGPL-3.0.
- *   - Commercial use, distribution, or deployment must adhere to AGPL obligations.
- *   - Proper attribution must be given to TITAN Softwork Solutions.
- *   - Modifications must be clearly documented.
- *   - This software is provided "as-is" without warranties of any kind.
- *
- *  Full License: https://www.gnu.org/licenses/agpl-3.0.html
- * ==================================================================================
- */
+#![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::{fmt, ops::Deref};
+use zeroize::Zeroize;
+
+/// Short license string for embedding/banners.
 pub const LICENSE: &str = "AGPL-3.0 © 2025 TITAN Softwork Solutions | KOENIG";
 
+/// All concrete engines live here (jesko, absolut, sadair, gamera, …).
 pub mod engines;
 
-use engines::*;
+use engines::{absolut, gamera, jesko, sadair};
 
-/// Used to dispatch encryption based on input
-#[derive(Debug, Clone, Copy)]
+/// Engine selector used by macros and call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KoenigEngine {
-    /// Jesko - stream cipher w/ keyed BLAKE3
+    /// Jesko — ChaCha20 + keyed BLAKE3 (hardened variant)
     Jesko,
-    /// Absolut - hardened Jesko variant
+    /// Absolut — ASCON-128 AEAD + KMAC/BLAKE3 DS
     Absolut,
-    /// Sadair - AES-256-GCM + entropy masking
+    /// Sadair — AES-256-GCM + BLAKE3 DS
     Sadair,
-    /// Gamera - fast obfuscator (non-crypto)
+    /// Gamera — fast non-crypto obfuscator
     Gamera,
 }
 
 impl KoenigEngine {
+    #[inline]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "jesko" => Some(Self::Jesko),
@@ -65,50 +54,102 @@ impl KoenigEngine {
     }
 }
 
-/// KOENIG Encryptor Trait
+/// A zeroizing string wrapper. Contents are wiped on drop.
 ///
-/// Implemented by each engine. Used by macros and dispatchers
-pub trait Encryptor {
-    /// Encrypt a plaintext with given seed, Returns:
-    /// - Encrypted payload
-    /// - 32-byte tag (MAC, padding, or dummy)
-    /// - 32-byte key fragment (4*8)
-    /// - 32-byte key mask (4*8)
-    fn encrypt(
-        plain: &[u8],
-        seed: u8,
-    ) -> (Vec<u8>, [u8; 32], [[u8; 8]; 4], [[u8; 8]; 4]);
+/// Use this as the return type of `Encryptor::decrypt` to avoid leaving
+/// plaintexts resident in heap memory longer than necessary.
+pub struct SecretStr(String);
 
-    /// Decrypt using all encrypted data parts + original seed
-    ///
-    /// Returns the plaintext as a UTF-8 string
-    fn decrypt(
-        ct: &[u8],
-        tag: &[u8],
-        frag: [[u8; 8]; 4],
-        mask: [[u8; 8]; 4],
-        seed: u8,
-    ) -> String;
+impl SecretStr {
+    /// Consume and return the inner `String` (no additional copy).
+    /// Note: this transfers ownership; zeroization will *not* occur on drop
+    /// of the wrapper (the caller now owns the `String`).
+    #[inline(always)]
+    pub fn into_inner(mut self) -> String {
+        let s = core::mem::take(&mut self.0);
+        core::mem::forget(self);
+        s
+    }
 }
 
-/// Unified encrypt dispatcher for all KOENIG engines
+impl Drop for SecretStr {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Deref for SecretStr {
+    type Target = str;
+    #[inline(always)]
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SecretStr {
+    #[inline(always)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<SecretStr> for String {
+    #[inline(always)]
+    fn from(mut s: SecretStr) -> Self {
+        let inner = core::mem::take(&mut s.0);
+        core::mem::forget(s);
+        inner
+    }
+}
+
+impl AsRef<str> for SecretStr {
+    #[inline(always)]
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// KOENIG engine interface implemented by each backend in `engines::*`.
 ///
-/// Internally routes to the correct engine's `Encryptor::encrypt`
+/// Conventions:
+/// - `seed` is a 64-bit value used for deterministic nonce/adversarial mixing.
+/// - `encrypt` returns `(ciphertext, tag32, key_frag, key_mask)` where:
+///   - `tag32` may be an authentication tag or a structured placeholder
+///     (engine-dependent). In hardened engines it is a real MAC (32 bytes).
+///   - `key_frag` and `key_mask` are 4×8-byte rows used to reconstruct the
+///     per-call master key at runtime (XOR of corresponding rows).
+pub trait Encryptor {
+    fn encrypt(
+        plain: &[u8],
+        seed: u64,
+    ) -> (Vec<u8>, [u8; 32], [[u8; 8]; 4], [[u8; 8]; 4]);
+
+    /// Decrypt using the returned pieces from `encrypt` and the same `seed`.
+    /// Implementations should verify integrity (if provided) and zeroize
+    /// intermediate material before returning.
+    fn decrypt(
+        ct: &[u8],
+        tag32: &[u8],
+        frag: [[u8; 8]; 4],
+        mask: [[u8; 8]; 4],
+        seed: u64,
+    ) -> SecretStr;
+}
+
+/// Dispatch encryption to a specific engine.
 ///
-/// # Example
-/// ```rust
-/// use koenig::{pulse, KoenigEngine};
-/// let (ct, tag, frag, mask) = pulse(KoenigEngine::Sadair, b"redline", 99);
-/// ```
+/// This is primarily used by the proc-macro crate at compile time.
+#[inline(always)]
 pub fn pulse(
     engine: KoenigEngine,
     plain: &[u8],
-    seed: u8,
+    seed: u64,
 ) -> (Vec<u8>, [u8; 32], [[u8; 8]; 4], [[u8; 8]; 4]) {
     match engine {
-        KoenigEngine::Jesko   => jesko::Jesko::encrypt(plain, seed),
+        KoenigEngine::Jesko => jesko::Jesko::encrypt(plain, seed),
         KoenigEngine::Absolut => absolut::Absolut::encrypt(plain, seed),
-        KoenigEngine::Sadair  => sadair::Sadair::encrypt(plain, seed),
-        KoenigEngine::Gamera  => gamera::Gamera::encrypt(plain, seed),
+        KoenigEngine::Sadair => sadair::Sadair::encrypt(plain, seed),
+        KoenigEngine::Gamera => gamera::Gamera::encrypt(plain, seed),
     }
 }
