@@ -11,6 +11,7 @@
 // - `no_std` friendly (uses `alloc`).
 // - Engines should minimize secret lifetimes and zeroize sensitive material.
 
+#![feature(core_intrinsics)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
